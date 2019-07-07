@@ -12,8 +12,12 @@ Detect noise changes in the environment
 
 :-d --delay float 1.0
     The delay in seconds between subsequent activations
+
+:-b --bands str -
+    A range/list of bands to listen for
 """
 import os
+import re
 from functools import partial
 from subprocess import Popen
 
@@ -24,8 +28,18 @@ from pylisten import FeatureListener
 from sonopy import mel_spec
 
 
+def parse_bands(s, m):
+    s = re.sub(r'\s', '', s)
+    if ',' in s:
+        return sum([parse_bands(i, m) for i in s.split(',')], [])
+    if '-' in s:
+        a, b = s.split('-')
+        return list(range(int(a or 0), int(b or m) + 1))
+    return [int(s)]
+
+
 def main():
-    args = create_parser(__doc__).parse_args()
+    parser = create_parser(__doc__)
 
     sample_rate = 16000
     stride = 500
@@ -35,6 +49,15 @@ def main():
     av_diff = None
     chunk_seconds = stride / sample_rate
     delay = 2.0
+
+    args = parser.parse_args()
+    try:
+        bands = parse_bands(args.bands, num_filt)
+        erase_bands = np.array([i not in bands for i in range(num_filt)])
+    except ValueError:
+        parser.error('Invalid brands expression')
+        return
+    print(bands)
 
     processor = partial(
         mel_spec, sample_rate=sample_rate, window_stride=(2 * stride, stride),
@@ -59,9 +82,9 @@ def main():
             else:
                 av_freq_stds = np.sqrt(av_diff)
                 freq_stds = diff / av_freq_stds
-                max_band = np.argmax(freq_stds)
+                max_band = np.argmax(np.where(erase_bands, float('-inf'), freq_stds))
                 max_freq_std = freq_stds[max_band]
-                if max_freq_std > args.trigger_volume:
+                if max_freq_std > args.trigger_volume and max_band in bands:
                     logger.info('Activation of {:.2f} on band {}!'.format(max_freq_std, max_band))
                     Popen(args.on_noise, shell=True, env=dict(
                         os.environ,

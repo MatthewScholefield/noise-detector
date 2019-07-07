@@ -19,10 +19,14 @@ pip install noise-detector
 Use like:
 
 ```bash
-$ noise-detector 'echo "Activation of $VOLUME"' --trigger-volume 3.5
+$ noise-detector 'echo "Activation of $VOLUME on band $BAND"' --trigger-volume 3.5
 ```
 
 You can see a list of all the environment variables available by
 looking in the source code.
 
+To reduce false activations, you can specify which bands you would like to listen to:
 
+```bash
+$ noise-detector 'echo "Heard middle-range activation"' --bands "4-8"
+```
