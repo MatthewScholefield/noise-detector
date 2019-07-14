@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='noise-detector',
-    version='0.1.1',
+    version='0.1.2',
     description='A simple tool to detect changes in environment noise',
     url='https://github.com/matthewscholefield/noise-detector',
     author='Matthew Scholefield',
