@@ -3,8 +3,7 @@ A tool to detect noise changes in the environment
 ~~~
 Detect noise changes in the environment
 
-:on_noise str
-    The command to run when noise is detected
+...
 
 :-v --trigger-volume float 0.9
     The average abnormality exceeded that is considered an activation. Between 0.0 and 1.0
@@ -182,7 +181,9 @@ def main():
     main_usage, detect_usage, collect_usage = __doc__.split('~~~\n')
     parser = create_parser(main_usage)
     sp = parser.add_subparsers(dest='action')
-    add_to_parser(sp.add_parser('detect'), detect_usage)
+    detect_parser = sp.add_parser('detect')
+    detect_parser.add_argument('command', nargs='?', default='true', help='The command to run when noise is detected')
+    add_to_parser(detect_parser, detect_usage)
     add_to_parser(sp.add_parser('collect'), collect_usage)
 
     averager = averager_gen()
@@ -211,14 +212,18 @@ def main():
 
 
 def run_detect(args, listener, bands):
-    delay = 6.0  # initial delay to collect samples
+    iterator = iter(listener)
+    logger.info('Collecting ambient noise...')
+    delay = chunk_seconds * args.memory_size
+
     if args.model:
         with open(args.model) as f:
             counts = SpecCounter.from_json(json.load(f))
             counts.memory = args.memory_size
     else:
         counts = SpecCounter(args.memory_size, bands)
-    for features in listener:
+
+    for features in iterator:
         abnormalities = counts.update(features)
         av_abnormality = sum(abnormalities.values()) / len(abnormalities)
 
@@ -229,7 +234,7 @@ def run_detect(args, listener, bands):
         else:
             if av_abnormality >= args.trigger_volume:
                 logger.info('Activation of {:.2f}'.format(av_abnormality))
-                Popen(args.on_noise, shell=True, env=dict(
+                Popen(args.command, shell=True, env=dict(
                     os.environ,
                     VOLUME='{:.2f}'.format(av_abnormality),
                     BANDS=json.dumps(abnormalities, sort_keys=True)
@@ -244,10 +249,12 @@ def run_collect(args, listener, bands):
 
     counts = SpecCounter(0, bands)
     try:
-        logger.info('Listening...')
-        for features in listener:
+        iterator = iter(listener)
+        logger.info('Collecting (press ctrl+c to end)...')
+        for features in iterator:
             counts.remember_noise(features)
     except KeyboardInterrupt:
+        print()
         logger.info('Saving model...')
         with open(args.noise_model, 'w') as f:
             json.dump(counts.serialize(), f)
