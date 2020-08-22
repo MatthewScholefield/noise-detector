@@ -22,7 +22,7 @@ setup(
         'pylisten',
         'sonopy',
         'numpy',
-        'prettyparse',
+        'prettyparse>=1.0.0',
         'logzero'
     ],
     entry_points={

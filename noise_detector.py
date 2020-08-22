@@ -1,33 +1,4 @@
-"""
-A tool to detect noise changes in the environment
-~~~
-Detect noise changes in the environment
-
-...
-
-:-v --trigger-volume float 0.9
-    The average abnormality exceeded that is considered an activation. Between 0.0 and 1.0
-
-:-d --delay float 1.0
-    The delay in seconds between subsequent activations
-
-:-b --bands str -
-    A range/list of bands to listen for
-
-:-m --model str -
-    A model file to use
-
-:-s --memory-size int 200
-    Number of samples to save in memory
-~~~
-Collect noise and save into a model
-
-:noise_model str
-    Noise model json file to write to
-
-:-b --bands str -
-    A range/list of bands to listen for
-"""
+from argparse import ArgumentParser
 from base64 import b64encode, b64decode
 from collections import deque
 
@@ -38,10 +9,52 @@ import numpy as np
 import os
 import re
 from logzero import logger
-from prettyparse import create_parser, add_to_parser
+from prettyparse import Usage
 from pylisten import FeatureListener
 from sonopy import power_spec, safe_log
 from subprocess import Popen
+
+usage = Usage('A tool to detect noise changes in the environment')
+detect_usage = Usage('''
+    Detect noise changes in the environment
+    
+    ...
+    
+    :-v --trigger-volume float 0.9
+        The average abnormality exceeded that is considered an activation. Between 0.0 and 1.0
+    
+    :-d --delay float 1.0
+        The delay in seconds between subsequent activations
+    
+    :-b --bands str -
+        A range/list of bands to listen for
+    
+    :-m --model str -
+        A model file to use
+    
+    :-s --memory-size int 200
+        Number of samples to save in memory
+''')
+detect_usage.add_argument('command', nargs='?', default='true', help='The command to run when noise is detected')
+collect_usage = Usage('''
+    Collect noise and save into a model
+    
+    :noise_model str
+        Noise model json file to write to
+    
+    :-b --bands str -
+        A range/list of bands to listen for
+''')
+
+
+def add_subparsers(parser: ArgumentParser):
+    sp = parser.add_subparsers(dest='action')
+    sp.required = True
+    detect_usage.apply(sp.add_parser('detect'))
+    collect_usage.apply(sp.add_parser('collect'))
+
+
+usage.add_customizer(add_subparsers)
 
 sample_rate = 16000
 stride = 400
@@ -178,18 +191,13 @@ class SpecCounter:
 
 
 def main():
-    main_usage, detect_usage, collect_usage = __doc__.split('~~~\n')
-    parser = create_parser(main_usage)
-    sp = parser.add_subparsers(dest='action')
-    detect_parser = sp.add_parser('detect')
-    detect_parser.add_argument('command', nargs='?', default='true', help='The command to run when noise is detected')
-    add_to_parser(detect_parser, detect_usage)
-    add_to_parser(sp.add_parser('collect'), collect_usage)
+    parser = ArgumentParser()
+    usage.apply(parser)
+    args = usage.render_args(parser.parse_args())
 
     averager = averager_gen()
     next(averager)
 
-    args = parser.parse_args()
     bands = get_bands(args, parser, num_bands)
 
     def processor(audio):
