@@ -1,4 +1,6 @@
 """
+A tool to detect noise changes in the environment
+~~~
 Detect noise changes in the environment
 
 :on_noise str
@@ -12,18 +14,41 @@ Detect noise changes in the environment
 
 :-b --bands str -
     A range/list of bands to listen for
+
+:-m --model str -
+    A model file to use
+
+:-s --memory-size int 200
+    Number of samples to save in memory
+~~~
+Collect noise and save into a model
+
+:noise_model str
+    Noise model json file to write to
+
+:-b --bands str -
+    A range/list of bands to listen for
 """
+from base64 import b64encode, b64decode
 from collections import deque
+
+import math
 
 import json
 import numpy as np
 import os
 import re
 from logzero import logger
-from prettyparse import create_parser
+from prettyparse import create_parser, add_to_parser
 from pylisten import FeatureListener
 from sonopy import power_spec, safe_log
 from subprocess import Popen
+
+sample_rate = 16000
+stride = 400
+width = 4
+num_bands = 257
+chunk_seconds = stride / sample_rate
 
 
 def parse_bands(s, m):
@@ -73,13 +98,30 @@ class BandCounter:
         existing_count = self.counts.get(k, 0)
         self.counts[k] = existing_count + 1
         if len(self.coords) > self.memory:
-            ok = self.coords.popleft()
-            nv = self.counts[ok] - 1
-            if nv:
-                self.counts[ok] = nv
-            else:
-                del self.counts[ok]
+            self._remove_one_coord()
         return 1.0 - existing_count / self.memory
+
+    def remember_noise(self, coord: np.ndarray):
+        """Remembers given coordinate as normal coordinates"""
+        k = self._key(coord)
+        self.counts[k] = self.counts.get(k, 0) + 1
+
+    def clear_state(self):
+        """Forgets recent coordinates"""
+        while self.coords:
+            self._remove_one_coord()
+
+    def log_squash(self, base):
+        self.counts = {k: math.log(count, base) for k, count in self.counts.items()}
+
+    def serialize(self):
+        return {'memory': self.memory, 'counts': {b64encode(k).decode(): v for k, v in self.counts.items()}}
+
+    @classmethod
+    def from_json(cls, obj):
+        counter = cls(obj['memory'])
+        counter.counts = {b64decode(k): v for k, v in obj['counts'].items()}
+        return counter
 
     def _key(self, x):
         return (x / self._calc_space()).astype(int).data.tobytes()
@@ -87,9 +129,18 @@ class BandCounter:
     def _calc_space(self):
         return 1.5  # TODO: Periodically regenerate this and recalculate counts
 
+    def _remove_one_coord(self):
+        ok = self.coords.popleft()
+        nv = self.counts[ok] - 1
+        if nv:
+            self.counts[ok] = nv
+        else:
+            del self.counts[ok]
+
 
 class SpecCounter:
     def __init__(self, memory, bands: list):
+        self._memory = memory
         self.bands = {band: BandCounter(memory) for band in bands}
 
     def update(self, frames):
@@ -97,16 +148,43 @@ class SpecCounter:
         coords = frames.T
         return {band: counter.update(coords[band]) for band, counter in self.bands.items()}
 
+    def clear_state(self):
+        for counter in self.bands.values():
+            counter.clear_state()
+
+    def remember_noise(self, frames):
+        """Remembers incoming audio as background noise"""
+        coords = frames.T
+        for band, counter in self.bands.items():
+            counter.remember_noise(coords[band])
+
+    @property
+    def memory(self):
+        return self._memory
+
+    @memory.setter
+    def memory(self, value):
+        for band in self.bands.values():
+            band.memory = value
+        self._memory = value
+
+    def serialize(self):
+        return {str(band): counter.serialize() for band, counter in self.bands.items()}
+
+    @classmethod
+    def from_json(cls, obj):
+        instance = cls(0, [])
+        instance.bands = {int(band): BandCounter.from_json(data) for band, data in obj.items()}
+        return instance
+
 
 def main():
-    parser = create_parser(__doc__)
+    main_usage, detect_usage, collect_usage = __doc__.split('~~~\n')
+    parser = create_parser(main_usage)
+    sp = parser.add_subparsers(dest='action')
+    add_to_parser(sp.add_parser('detect'), detect_usage)
+    add_to_parser(sp.add_parser('collect'), collect_usage)
 
-    sample_rate = 16000
-    stride = 400
-    width = 4
-    delay = 6.0
-    num_bands = 257
-    chunk_seconds = stride / sample_rate
     averager = averager_gen()
     next(averager)
 
@@ -120,8 +198,27 @@ def main():
         ))
         return np.array([averager.send(i) for i in log_spec] or log_spec)
 
-    counts = SpecCounter(200, bands)
-    for features in FeatureListener(processor, stride, width, dict(rate=sample_rate)):
+    listener = FeatureListener(processor, stride, width, dict(rate=sample_rate))
+
+    if args.action == 'detect':
+        if args.model and args.bands:
+            parser.error('Cannot specify bands when using a noise model')
+        run_detect(args, listener, bands)
+    elif args.action == 'collect':
+        run_collect(args, listener, bands)
+    else:
+        raise RuntimeError
+
+
+def run_detect(args, listener, bands):
+    delay = 6.0  # initial delay to collect samples
+    if args.model:
+        with open(args.model) as f:
+            counts = SpecCounter.from_json(json.load(f))
+            counts.memory = args.memory_size
+    else:
+        counts = SpecCounter(args.memory_size, bands)
+    for features in listener:
         abnormalities = counts.update(features)
         av_abnormality = sum(abnormalities.values()) / len(abnormalities)
 
@@ -138,6 +235,22 @@ def main():
                     BANDS=json.dumps(abnormalities, sort_keys=True)
                 ))
                 delay = args.delay
+
+
+def run_collect(args, listener, bands):
+    # Ensure writable noise model
+    with open(args.noise_model, 'w') as f:
+        f.write('{}')
+
+    counts = SpecCounter(0, bands)
+    try:
+        logger.info('Listening...')
+        for features in listener:
+            counts.remember_noise(features)
+    except KeyboardInterrupt:
+        logger.info('Saving model...')
+        with open(args.noise_model, 'w') as f:
+            json.dump(counts.serialize(), f)
 
 
 if __name__ == '__main__':
