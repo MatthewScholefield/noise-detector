@@ -1,10 +1,12 @@
 from argparse import ArgumentParser
 from base64 import b64encode, b64decode
-from collections import deque
+from collections import deque, namedtuple
 
 import math
 
 import json
+from typing import Callable, Iterable
+
 import numpy as np
 import os
 import re
@@ -40,7 +42,7 @@ detect_usage.add_argument('command', nargs='?', default='true', help='The comman
 collect_usage = Usage('''
     Collect noise and save into a model
     
-    :noise_model str
+    :model str
         Noise model json file to write to
     
     :-b --bands str -
@@ -62,6 +64,8 @@ stride = 400
 width = 4
 num_bands = 257
 chunk_seconds = stride / sample_rate
+
+DetectionData = namedtuple('DetectionData', 'volume bands')
 
 
 def parse_bands(s, m):
@@ -198,82 +202,114 @@ class SpecCounter:
         return instance
 
 
+class NoiseDetector:
+    def __init__(self, bands: list = None, memory_size=200, model: str = None):
+        self.bands = bands or list(range(num_bands))
+        self.model = model
+
+        if model:
+            with open(model) as f:
+                self.counter = SpecCounter.from_json(json.load(f))
+                self.counter.memory = memory_size
+        else:
+            self.counter = SpecCounter(memory_size, self.bands)
+
+    def default_listener(self):
+        averager = averager_gen()
+        next(averager)
+
+        def processor(audio):
+            log_spec = safe_log(power_spec(
+                audio, window_stride=(2 * stride, stride),
+                fft_size=512
+            ))
+            return np.array([averager.send(i) for i in log_spec] or log_spec)
+
+        return FeatureListener(processor, stride, width, dict(rate=sample_rate))
+
+    def listen(self, on_detection: Callable, on_listening=lambda: None, trigger_volume=0.8, activation_delay=0.25,
+               listener: Iterable = None):
+        listener = listener or self.default_listener()
+        delay = chunk_seconds * self.counter.memory
+
+        for features in listener:
+            abnormalities = self.counter.update(features)
+            av_abnormality = sum(abnormalities.values()) / len(abnormalities)
+
+            if delay > 0:
+                delay -= chunk_seconds
+                if delay <= 0:
+                    on_listening()
+            else:
+                if av_abnormality >= trigger_volume:
+                    on_detection(DetectionData(av_abnormality, abnormalities))
+                    delay = activation_delay
+
+    def collect(self, listener: Iterable = None):
+        listener = listener or self.default_listener()
+        for features in listener:
+            self.counter.remember_noise(features)
+
+    def save(self):
+        with open(self.model, 'w') as f:
+            json.dump(self.counter.serialize(), f)
+
+
+def run_detect(args, detector):
+    iterator = iter(detector.default_listener())
+    logger.info('Collecting ambient noise...')
+
+    def on_detection(detection_data: DetectionData):
+        logger.info('Activation of {:.2f}'.format(detection_data.volume))
+        Popen(args.command, shell=True, env=dict(
+            os.environ,
+            VOLUME='{:.2f}'.format(detection_data.volume),
+            BANDS=json.dumps(detection_data.bands, sort_keys=True)
+        ))
+
+    detector.listen(
+        on_detection,
+        on_listening=lambda: logger.info('Listening...'),
+        trigger_volume=args.trigger_volume,
+        activation_delay=args.delay,
+        listener=iterator
+    )
+
+
+def run_collect(args, detector):
+    # Ensure writable noise model
+    with open(detector.model, 'w') as f:
+        f.write('{}')
+
+    iterator = iter(detector.default_listener())
+    try:
+        logger.info('Collecting (press ctrl+c to end)...')
+        detector.collect(iterator)
+    except KeyboardInterrupt:
+        print()
+        logger.info('Saving model...')
+        detector.save()
+
+
 def main():
     parser = ArgumentParser()
     usage.apply(parser)
     args = usage.render_args(parser.parse_args())
 
-    averager = averager_gen()
-    next(averager)
-
-    bands = get_bands(args, parser, num_bands)
-
-    def processor(audio):
-        log_spec = safe_log(power_spec(
-            audio, window_stride=(2 * stride, stride),
-            fft_size=512
-        ))
-        return np.array([averager.send(i) for i in log_spec] or log_spec)
-
-    listener = FeatureListener(processor, stride, width, dict(rate=sample_rate))
+    detector = NoiseDetector(
+        bands=get_bands(args, parser, num_bands),
+        memory_size=args.memory_size if args.action == 'detect' else 0,
+        model=args.model
+    )
 
     if args.action == 'detect':
         if args.model and args.bands:
             parser.error('Cannot specify bands when using a noise model')
-        run_detect(args, listener, bands)
+        run_detect(args, detector)
     elif args.action == 'collect':
-        run_collect(args, listener, bands)
+        run_collect(args, detector)
     else:
         raise RuntimeError
-
-
-def run_detect(args, listener, bands):
-    iterator = iter(listener)
-    logger.info('Collecting ambient noise...')
-    delay = chunk_seconds * args.memory_size
-
-    if args.model:
-        with open(args.model) as f:
-            counts = SpecCounter.from_json(json.load(f))
-            counts.memory = args.memory_size
-    else:
-        counts = SpecCounter(args.memory_size, bands)
-
-    for features in iterator:
-        abnormalities = counts.update(features)
-        av_abnormality = sum(abnormalities.values()) / len(abnormalities)
-
-        if delay > 0:
-            delay -= chunk_seconds
-            if delay <= 0:
-                logger.info('Listening...')
-        else:
-            if av_abnormality >= args.trigger_volume:
-                logger.info('Activation of {:.2f}'.format(av_abnormality))
-                Popen(args.command, shell=True, env=dict(
-                    os.environ,
-                    VOLUME='{:.2f}'.format(av_abnormality),
-                    BANDS=json.dumps(abnormalities, sort_keys=True)
-                ))
-                delay = args.delay
-
-
-def run_collect(args, listener, bands):
-    # Ensure writable noise model
-    with open(args.noise_model, 'w') as f:
-        f.write('{}')
-
-    counts = SpecCounter(0, bands)
-    try:
-        iterator = iter(listener)
-        logger.info('Collecting (press ctrl+c to end)...')
-        for features in iterator:
-            counts.remember_noise(features)
-    except KeyboardInterrupt:
-        print()
-        logger.info('Saving model...')
-        with open(args.noise_model, 'w') as f:
-            json.dump(counts.serialize(), f)
 
 
 if __name__ == '__main__':
