@@ -8,6 +8,7 @@ import json
 import numpy as np
 import os
 import re
+
 from logzero import logger
 from prettyparse import Usage
 from pylisten import FeatureListener
@@ -100,6 +101,7 @@ def averager_gen(adjustment_speed=0.01):
 class BandCounter:
     def __init__(self, memory):
         self.memory = memory
+        self.num_saved_chunks = 0
         self.coords = deque()
         self.counts = {}
 
@@ -117,6 +119,7 @@ class BandCounter:
         """Remembers given coordinate as normal coordinates"""
         k = self._key(coord)
         self.counts[k] = self.counts.get(k, 0) + 1
+        self.num_saved_chunks += 1
 
     def clear_state(self):
         """Forgets recent coordinates"""
@@ -127,12 +130,17 @@ class BandCounter:
         self.counts = {k: math.log(count, base) for k, count in self.counts.items()}
 
     def serialize(self):
-        return {'memory': self.memory, 'counts': {b64encode(k).decode(): v for k, v in self.counts.items()}}
+        return {
+            'memory': self.memory,
+            'num_saved_chunks': self.num_saved_chunks,
+            'counts': {b64encode(k).decode(): v for k, v in self.counts.items()}
+        }
 
     @classmethod
     def from_json(cls, obj):
         counter = cls(obj['memory'])
         counter.counts = {b64decode(k): v for k, v in obj['counts'].items()}
+        counter.num_saved_chunks = obj['num_saved_chunks']
         return counter
 
     def _key(self, x):
